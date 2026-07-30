@@ -1,0 +1,46 @@
+# ConfigMap containing the Dockerfile that KMM uses to build kernel modules
+# in-cluster. KMM injects KERNEL_VERSION and DTK_AUTO at build time.
+#
+# DTK_AUTO is automatically resolved by KMM to the Driver Toolkit image
+# matching the node's kernel — no manual DTK tag management needed.
+#
+# The final image includes both:
+#   - Compiled kernel modules (bnxt_en.ko, bnxt_re.ko)
+#   - Userspace library (libbnxt_re-rdmav57.so) for host deployment
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: broadcom-bnxt-build
+  namespace: openshift-kmm
+data:
+  dockerfile: |
+    ARG DTK_AUTO
+    ARG KERNEL_VERSION
+    ARG BROADCOM_SRC_IMAGE
+
+    # Stage 1: Pull Broadcom source + UMD from the source image
+    FROM ${BROADCOM_SRC_IMAGE} AS src
+
+    # Stage 2: Compile kernel modules using the Driver Toolkit
+    FROM ${DTK_AUTO} AS builder
+
+    ARG KERNEL_VERSION
+
+    COPY --from=src /src/bnxt_en/ /src/bnxt_en/
+    COPY --from=src /src/bnxt_re/ /src/bnxt_re/
+
+    # Build bnxt_en first (bnxt_re depends on it)
+    WORKDIR /src/bnxt_en
+    RUN make KVER=${KERNEL_VERSION} && make install KVER=${KERNEL_VERSION}
+
+    # Build bnxt_re
+    WORKDIR /src/bnxt_re
+    RUN make KVER=${KERNEL_VERSION} && make install KVER=${KERNEL_VERSION}
+
+    # Stage 3: Final image with kernel modules + userspace library
+    FROM registry.access.redhat.com/ubi9/ubi-minimal:latest
+    ARG KERNEL_VERSION
+
+    COPY --from=builder /lib/modules/${KERNEL_VERSION}/extra/ /opt/lib/modules/${KERNEL_VERSION}/extra/
+    COPY --from=src /src/lib/libbnxt_re-rdmav57.so /opt/lib64/libbnxt_re-rdmav57.so

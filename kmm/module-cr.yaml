@@ -1,0 +1,78 @@
+# KMM Module CR — builds, loads kernel modules, and deploys the userspace
+# library (libbnxt_re-rdmav57.so) onto OpenShift nodes. Single resource,
+# no separate DaemonSet needed.
+#
+# KMM automatically builds the modules in-cluster against the running node's
+# kernel. When nodes upgrade kernels, KMM detects the mismatch and triggers
+# a rebuild.
+#
+# Prerequisites:
+#   - KMM operator v2.6+ installed on the cluster
+#   - Source image (broadcom-bnxt-src) pushed to <registry>
+#   - A registry where KMM can push built module images
+#   - Nodes with Broadcom NICs labeled (e.g. via NFD)
+#
+# Adjust <registry>, namespace, and selector labels for your environment.
+---
+apiVersion: kmm.sigs.x-k8s.io/v1beta2
+kind: Module
+metadata:
+  name: broadcom-bnxt
+  namespace: openshift-kmm
+spec:
+  moduleLoader:
+    container:
+      modprobe:
+        moduleName: bnxt_re
+        dirName: /opt/lib/modules/${KERNEL_FULL_VERSION}
+      kernelMappings:
+        - regexp: '^.*\.el9.*$'
+          containerImage: <registry>/broadcom-bnxt-kmm:237.1.137.0-${KERNEL_FULL_VERSION}
+          build:
+            dockerfileConfigMap:
+              name: broadcom-bnxt-build
+            buildArgs:
+              - name: KERNEL_VERSION
+                value: "${KERNEL_FULL_VERSION}"
+              - name: DTK_AUTO
+                value: "${DTK_AUTO}"
+              - name: BROADCOM_SRC_IMAGE
+                value: "<registry>/broadcom-bnxt-src:237.1.137.0"
+      # Copy the userspace library to the host, then load modules
+      command:
+        - /bin/sh
+        - -c
+        - |
+          cp /opt/lib64/libbnxt_re-rdmav57.so /broadcom-host-lib/libbnxt_re-rdmav57.so
+          modprobe -d /opt/lib/modules/${KERNEL_FULL_VERSION} bnxt_re
+          echo ""
+          echo "=========================================="
+          echo " Broadcom OOB driver deployed successfully"
+          echo "=========================================="
+          echo ""
+          echo " Kernel modules loaded: bnxt_en, bnxt_re"
+          echo " Userspace library:     /opt/broadcom/lib64/libbnxt_re-rdmav57.so"
+          echo ""
+          echo " To mount the UMD into vLLM containers, use:"
+          echo ""
+          echo "   volumes:"
+          echo "     - name: libbnxt-re"
+          echo "       hostPath:"
+          echo "         path: /opt/broadcom/lib64/libbnxt_re-rdmav57.so"
+          echo "         type: File"
+          echo ""
+          echo "=========================================="
+      volumeMounts:
+        - name: broadcom-lib
+          mountPath: /broadcom-host-lib
+    serviceAccountName: kmm-operator-module-loader
+    volumes:
+      - name: broadcom-lib
+        hostPath:
+          path: /opt/broadcom/lib64
+          type: DirectoryOrCreate
+  imageRepoSecret:
+    name: broadcom-bnxt-registry-creds
+  selector:
+    node-role.kubernetes.io/worker: ""
+    feature.node.kubernetes.io/pci-14e4.present: "true"

@@ -1,0 +1,31 @@
+# Example vLLM pod with the Broadcom UMD mounted from the host.
+#
+# This assumes:
+#   - The KMM Module CR has placed libbnxt_re-rdmav57.so at
+#     /opt/broadcom/lib64/ on the host.
+#   - The container image is a Red Hat RHEL 9-based vLLM image.
+#
+# For other image families (upstream ROCm, CUDA), adjust mountPath per
+# the "Container Mount Path Reference" table in README.md.
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: vllm-rhel
+  labels:
+    app: vllm
+spec:
+  nodeSelector:
+    feature.node.kubernetes.io/pci-14e4.present: "true"
+  containers:
+    - name: vllm
+      image: registry.redhat.io/rhaii/vllm-rocm-rhel9:3.4.1
+      volumeMounts:
+        - name: libbnxt-re
+          mountPath: /usr/lib64/libibverbs/libbnxt_re-rdmav34.so
+          readOnly: true
+  volumes:
+    - name: libbnxt-re
+      hostPath:
+        path: /opt/broadcom/lib64/libbnxt_re-rdmav57.so
+        type: File

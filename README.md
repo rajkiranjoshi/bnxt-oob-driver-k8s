@@ -1,22 +1,28 @@
-# Broadcom bnxt OOB Driver for GPUDirect RDMA on Kubernetes
+# Broadcom bnxt OOB Driver for RDMA on K8s
 
 ## The Problem
 
-### RDMA Userspace vs Kernel Drivers (UMD / KMD)
+### Background: RDMA Userspace vs Kernel Drivers (UMD / KMD)
 
-RDMA (RoCEv2) splits the driver stack into two cooperating halves:
+RDMA (RoCEv2) splits the driver stack into two cooperating halves. This
+split is part of the standard RDMA architecture (via libibverbs) and is
+not specific to any NIC vendor:
 
 | Layer | Name | Runs where | Example (Broadcom) | Example (NVIDIA) |
 |---|---|---|---|---|
 | **KMD** | Kernel-Mode Driver | Host kernel | `bnxt_re.ko` | `mlx5_ib.ko` |
 | **UMD** | User-Mode Driver | Process / container | `libbnxt_re-rdmav34.so` | `libmlx5-rdmav34.so` |
 
-The application stack (e.g. vLLM, MoRI, NCCL, NIXL, NVSHMEM) talks to
+The application stack (e.g. vLLM, NIXL, NVSHMEM, NCCL, Mori-IO/EP) talks to
 **libibverbs**, which loads a vendor **provider** (the UMD). That UMD issues
 ioctls through `/dev/infiniband/uverbs*` to the host **KMD**. Memory
 registration (`ibv_reg_mr`), GPUDirect / dmabuf pinning, and queue-pair setup
-all cross this UMD↔KMD boundary via the provider **uABI** (the kernel **uAPI**
-structs and version advertised for that driver).
+all cross this UMD↔KMD boundary.
+
+The contract between the UMD and KMD is called the **uABI** (userspace
+Application Binary Interface) — a set of versioned kernel structs exposed via
+the **uAPI** (userspace Application Programming Interface) for that driver.
+The UMD and KMD must agree on this ABI, which is why version alignment matters.
 
 ```text
   ┌─────────────────────────────────────────────────────────┐
@@ -36,7 +42,7 @@ structs and version advertised for that driver).
   │   /dev/infiniband/uverbsX                               │
   │        │                                                │
   │        ▼                                                │
-  │   KMD (bnxt_re.ko / mlx5_ib.ko)  ──►  NIC (RoCEv2)      │
+  │   KMD (bnxt_re.ko / mlx5_ib.ko)  ──►  NIC h/w (RoCEv2)  │
   └─────────────────────────────────────────────────────────┘
 ```
 
@@ -44,9 +50,9 @@ If the UMD and KMD disagree on that provider uABI (or on optional feature
 layouts behind it), verbs calls fail — often at memory registration — and
 GPUDirect RDMA breaks.
 
-### Broadcom BCM57608 (Thor) — Why Matching Matters
+### Broadcom BCM57608 (Thor2) — Why Matching Matters
 
-This shows up on Broadcom RoCEv2 NICs (e.g. **BCM57608 / Thor-2**) when enabling
+This shows up on Broadcom RoCEv2 NICs (e.g. **BCM57608 / Thor2**) when enabling
 **GPUDirect RDMA** for **CUDA** (NVIDIA GPUs / NCCL) or **ROCm** (AMD Instinct /
 RCCL) workloads:
 
@@ -63,19 +69,12 @@ RCCL) workloads:
    ranges.
 
 2. **Infra providers are required to install that out-of-tree KMD on the host.**  
-   For Thor AI **GPUDirect RDMA** deployments (CUDA or ROCm), clusters must load
+   For Thor2 AI **GPUDirect RDMA** deployments (CUDA or ROCm), clusters must load
    Broadcom’s OOB `bnxt_re` (and matching `bnxt_en`, typically via DKMS / KMM /
    Broadcom’s installer) from the same Broadcom release train as the NIC
    firmware — not rely on the distro inbox modules alone.
 
-3. **The product image still ships an inbox (or pinned) UMD.**  
-   - CUDA `vllm/vllm-openai`: `libibverbs-dev` → hard-depends on
-     `ibverbs-providers` → **inbox** `libbnxt_re` only.  
-   - ROCm `vllm/vllm-openai-rocm`: same inbox providers, **plus** Broadcom
-     `bnxt-rocelib` (e.g. `235.2.86.0`) for MoRI — still a **fixed** package
-     train, not automatically equal to whatever KMD is on every host.
-
-4. **Broadcom does not provide mlx5-style forward/backward UMD↔KMD
+3. **Broadcom does not provide mlx5-style forward/backward UMD↔KMD
    compatibility between inbox and OOB (or across arbitrary OOB trains).**  
    Upstream `bnxt` / `rdma-core` keep `BNXT_RE_ABI_VERSION` at **1** and extend
    via `comp_mask`. Broadcom’s OOB `bnxt_re` historically advertises a **higher**
@@ -87,77 +86,39 @@ RCCL) workloads:
    KMD; a Broadcom engineer stated they maintain compatibility between the
    *out-of-tree driver and out-of-tree library*, not with distro/`rdma-core`
    UMD ([linux-rdma mailing list, Jun 2024](https://www.spinics.net/lists/linux-rdma/msg124163.html)).
-   Broadcom also ships `bnxt_en` / `bnxt_re` / `libbnxt_re` as a **matched
-   release bundle** (and FAQ cases cover inbox UMD reappearing after
-   `rdma-core` updates). Cross-train mixes (e.g. image `bnxt-rocelib` **235.x**
-   vs host OOB **231.x**, or inbox UMD vs OOB KMD) are unsupported and fail at
-   provider match / device open — before reliable GPUDirect memory registration.
+   Broadcom ships `bnxt_en` / `bnxt_re` / `libbnxt_re` as a **matched
+   release bundle**. Cross-train mixes (e.g. OOB UMD **235.x** vs host OOB KMD
+   **231.x**, or inbox UMD vs OOB KMD) are unsupported and fail at provider
+   match / device open — before any GPUDirect memory registration can occur.
 
-**Net result:** the UMD (`libbnxt_re*.so`) used inside the product must come
+**Net result:** the UMD (`libbnxt_re*.so`) used inside any application container image (e.g. vLLM) must come
 from the **same Broadcom release train** as the KMD (`bnxt_re`) loaded on the
-host.
+host OS.
 
-### GPUDirect peer-memory paths: `ib_peer_mem` vs dmabuf
+---------------
 
-GPUDirect RDMA needs a way for the RDMA stack to pin/map **GPU** memory. On
-Broadcom Thor this is not just `libbnxt_re` ↔ `bnxt_re`; two host-side approaches
-matter for CUDA and ROCm:
+### Why NVIDIA ConnectX (CX-6/CX-7) does not hit this issue
 
-| Path | What it is | Typical stack |
+| | Broadcom Thor2 (`bnxt`) | NVIDIA ConnectX (`mlx5`) |
 |---|---|---|
-| **Legacy Peer Memory Direct** | Broadcom’s peer-mem client model | `ib_peer_mem` **kernel module** (+ GPU-side peer module) |
-| **dmabuf** | Upstream DMA-BUF registration | `ibv_reg_dmabuf_mr` via a capable matched UMD/KMD |
-
-**`ib_peer_mem` is a kernel module, not a userspace library.** It ships in
-Broadcom’s Peer Memory Direct / `netxtreme-peer-mem` package (often as DKMS)
-alongside the OOB `bnxt_en` / `bnxt_re` modules for that same release.
-
-**Legacy (non-dmabuf) CUDA path — yes, both modules together:** Broadcom’s
-NVIDIA GPUDirect / Peer Memory Direct docs load **`ib_peer_mem`** (NIC/RDMA
-peer client) **and** **`nvidia-peermem`** (NVIDIA GPU driver peer module), plus
-`bnxt_en` / `bnxt_re`. They solve different sides of the P2P path; one does not
-replace the other. Exception: some distro kernels already expose inbox
-peer-memory APIs — Broadcom’s build may then skip its `ib_peer_mem` module, and
-`nvidia-peermem` alone can be enough on that kernel.
-
-**ROCm:** Broadcom’s AMD Instinct (e.g. MI300X) guides likewise require
-`ib_peer_mem` for Peer Memory Direct with ROCm/RCCL workloads (paired with the
-AMD GPU driver stack, not `nvidia-peermem`).
-
-**Version matching on the legacy path:** treat `ib_peer_mem` like `bnxt_re` —
-it must come from the **same Broadcom release train** as the loaded
-`bnxt_en` / `bnxt_re` (the peer-mem DKMS bundle is versioned with them). Do not
-mix an older `ib_peer_mem` with a newer OOB `bnxt_re` train.
-
-**dmabuf path:** newer userspace/kernel registration (`ibv_reg_dmabuf_mr`) used
-by modern CUDA/ROCm collectives and libraries. It still requires a
-**version-matched, GPUDirect-capable** `libbnxt_re` ↔ `bnxt_re` pair; inbox UMD
-against OOB KMD will not reliably enable it. Whether a given cluster uses
-legacy peer-mem, dmabuf, or both depends on kernel, GPU driver, and app stack —
-the UMD/KMD match requirement remains either way.
-
-### Why NVIDIA ConnectX (CX-6/CX-7) Does Not Hit This
-
-| | Broadcom Thor (`bnxt`) | NVIDIA ConnectX (`mlx5`) |
-|---|---|---|
-| UMD in typical AI images | Inbox and/or vendor `bnxt-rocelib` pin | Distro `libmlx5` via `ibverbs-providers` |
-| KMD on hosts | Often **OOB** for GPUDirect / Thor features | Inbox and/or DOCA-OFED; uAPI kept stable |
+| UMD in typical AI app images | Inbox and/or vendor `bnxt-rocelib` pin | Inbox `libmlx5` via `ibverbs-providers` |
+| KMD on hosts | Often **OOB** for GPUDirect / Thor2 features | Inbox and/or DOCA-OFED; uAPI kept stable |
 | UMD↔KMD contract | OOB stack requires matching Broadcom UMD | Strong: `MLX5_IB_UVERBS_ABI_VERSION` stays at 1; `comp_mask`, versioned structs, capability negotiation |
 | RDMA device exposure in Kubernetes | Same for both (see note below) | Same for both (see note below) |
-| Day-2 effort | High — align host/image Broadcom train, or mount host UMD | Low — image `libmlx5` usually works with host `mlx5_ib` |
+| Day-2 effort | High — align host/app image Broadcom train, or mount host UMD | Low — app image `libmlx5` usually works with host `mlx5_ib` |
 
 > **Kubernetes device plugins (same for both NICs):** RDMA Shared Device Plugin,
 > SR-IOV Network Device Plugin, and (on NVIDIA clusters) the Network Operator’s
 > device-plugin path all expose InfiniBand character devices such as
 > `/dev/infiniband/uverbs*` into the pod. They are **not** Broadcom- or
 > mlx5-specific library injectors: they do **not** mount `libbnxt_re` or
-> `libmlx5` into application containers. The UMD must already be in the image
+> `libmlx5` into application containers. The UMD must already be in the app image
 > (or mounted separately, as in this guide). The difference is only whether
-> that image UMD can safely talk to the host KMD.
+> that app image UMD can safely talk to the host KMD.
 
 `libmlx5` and `mlx5_ib` live in upstream `rdma-core` / mainline Linux with a
 deliberate compatibility model: an older container UMD can talk to a newer host
-KMD and fall back on unsupported features instead of breaking core verbs.
+KMD and fall back on unsupported features instead of breaking core verbs. This is not true for `libbnxt_re` and `bnxt_re`. 
 
 ### Bottom Line
 
@@ -166,20 +127,35 @@ provider must match the host kernel module (`bnxt_re.ko`). If the host runs an o
 Broadcom driver (e.g., installed via the Kernel Module Management (KMM) operator), the
 container's bundled or inbox library will be incompatible.
 
-## The Solution (Two Parts)
 
-The full solution has two parts:
+## The Solution: High-level Idea
 
-| Part | Who | What |
+The problem boils down to: the Broadcom driver library inside the AI application
+container does not match the Broadcom driver loaded on the host OS. Unlike NVIDIA
+ConnectX NICs (where this "just works"), Broadcom requires an explicit version
+match between the host-side driver and the container-side library.
+
+The fix is a two-step deployment — one owned by the infrastructure team, the
+other by the application platform team:
+
+| Step | Owner | What happens |
 |---|---|---|
-| **1. Infra (KMD + UMD on host)** | Platform / SRE team | Install Broadcom's OOB kernel modules (`bnxt_en`, `bnxt_re`, optionally `ib_peer_mem`) **and** the matching userspace library (`libbnxt_re`) onto every RDMA-capable node via KMM on OpenShift |
-| **2. Application (UMD mount into pod)** | AI/ML platform team | Mount the host-installed `libbnxt_re` into the vLLM container at the path its `libibverbs` expects |
+| **1. Host setup** | Platform / SRE team | Install Broadcom's out-of-tree kernel drivers **and** the matching userspace library onto every GPU/RDMA node. On OpenShift, this can be automated via the Kernel Module Management (KMM) operator. |
+| **2. Container mount** | AI/ML platform team | At pod startup, mount the host-installed library into the application container so it replaces the mismatched inbox copy. No container image rebuild required. |
 
----
+Once both steps are in place, the application (vLLM, NCCL, etc.) transparently
+picks up the correct library and GPUDirect RDMA works.
 
-## Part 1: Infra — Installing the OOB Driver via KMM on OpenShift
 
-### Reference Environment (Reported by Infra/SRE Team)
+
+## The Solution: Details (WIP: NOT validated)
+
+The sections below walk through each step in detail — first the
+infrastructure setup, then the application-side container mount.
+
+### Part 1: Infra — Installing the OOB Driver via KMM on OpenShift
+
+#### Reference Environment (Reported by Infra/SRE Team)
 
 | Component | Version |
 |---|---|
@@ -194,7 +170,7 @@ The full solution has two parts:
 > source and KMM configuration work regardless of the specific RHCOS kernel version on the
 > cluster.
 
-### Package Contents (`nxe_linux_237.1.148.0.tar.gz`)
+#### Package Contents (`nxe_linux_237.1.148.0.tar.gz`)
 
 The package from Broadcom Support (component version **237.1.137.0**) contains:
 
@@ -212,7 +188,7 @@ The package from Broadcom Support (component version **237.1.137.0**) contains:
 > library (`libbnxt_re-rdmav57.so`) is a prebuilt binary — it is kernel-version-independent
 > and does not need recompilation.
 
-### Where `libbnxt_re` Installs on RHEL 9 (Standard RPM Path)
+#### Where `libbnxt_re` Installs on RHEL 9 (Standard RPM Path)
 
 The `libbnxt_re-237.1.137.0-rhel9u7.x86_64.rpm` installs these files:
 
@@ -231,7 +207,7 @@ The `libbnxt_re-237.1.137.0-rhel9u7.x86_64.rpm` installs these files:
 > versions v14–v56 (per their readme), and libibverbs loads the provider via `dlopen()` on the
 > mounted path regardless of the internal SONAME.
 
-### OpenShift Host OS Considerations
+#### OpenShift Host OS Considerations
 
 OpenShift worker nodes can run either **RHCOS** or **RHEL**:
 
@@ -259,7 +235,7 @@ the kernel modules. No separate DaemonSet needed.
 /opt/broadcom/lib64/libbnxt_re-rdmav57.so
 ```
 
-### How to Verify the Library Is on the Host
+#### How to Verify the Library Is on the Host
 
 After deploying the KMM Module CR, confirm the library is in place:
 
@@ -273,7 +249,7 @@ Expected output:
 -rwxr-xr-x. 1 root root 98336 ... /opt/broadcom/lib64/libbnxt_re-rdmav57.so
 ```
 
-### Verifying KMD + UMD Are Working on the Host
+#### Verifying KMD + UMD Are Working on the Host
 
 Once the kernel modules are loaded and `libbnxt_re` is on disk, verify from a debug pod:
 
@@ -294,7 +270,7 @@ kubectl debug node/<node-name> -it --image=registry.access.redhat.com/ubi9/ubi-m
 '
 ```
 
-### KMM Module CR (In-Cluster Auto-Build)
+#### KMM Module CR (In-Cluster Auto-Build)
 
 KMM builds kernel modules **and** deploys the userspace library **in-cluster, automatically** —
 the same pattern NVIDIA Network Operator uses for DOCA/OFED drivers. You push a **source image**
@@ -352,16 +328,18 @@ spec:
 
 ---
 
-## Part 2: Application — Mounting the Host UMD into the vLLM Container
+### Part 2: Application — Mounting the Host UMD into the Container
 
-The second part is to mount the host-installed `libbnxt_re-rdmav57.so` into the container
-at the path its `libibverbs` expects.
+With the driver and library now on the host (via Part 1), the remaining step is
+a volume mount in the pod spec: map the host’s `libbnxt_re-rdmav57.so` into the
+container at the path where `libibverbs` expects to find the provider `.so`.
 
----
+No container image rebuild is required — the mount overrides the inbox library
+at runtime. The exact mount target depends on the base OS and image family.
 
-## Container Mount Path Reference
+#### Container Mount Path Reference
 
-### Upstream vLLM Images (Docker Hub)
+#### Upstream vLLM Images (Docker Hub)
 
 The mount target inside the container depends on the image family:
 
@@ -383,7 +361,7 @@ The mount target inside the container depends on the image family:
 > Broadcom PPA — so they have just the small inbox stub at the standard libibverbs
 > providers path.
 
-### Red Hat Registry Images (registry.redhat.io)
+#### Red Hat Registry Images (registry.redhat.io)
 
 All Red Hat vLLM images are RHEL 9 based and use the **same** `mountPath`. None of them
 ship the custom Broadcom `bnxt-rocelib` package — they all have only the inbox provider
@@ -418,7 +396,7 @@ Catalog links:
 
 ---
 
-### How Upstream vLLM ROCm Images Add the Broadcom UMD
+#### How Upstream vLLM ROCm Images Add the Broadcom UMD
 
 The `rdma-core` package is **inbox (distro)** in ALL images — ROCm and CUDA alike. The ROCm
 Dockerfile ([`docker/Dockerfile.rocm`](https://github.com/vllm-project/vllm/blob/1479bd9e9d3e7e06a4167980d4d4662eeda0638c/docker/Dockerfile.rocm))
@@ -460,7 +438,7 @@ or `bnxt-rocelib` at all — hence CUDA images only have the small inbox stub.
 
 ---
 
-## Pod YAML Configuration
+#### Pod YAML Configuration
 
 ```yaml
 apiVersion: v1
@@ -485,7 +463,7 @@ spec:
         type: File
 ```
 
-### Placeholders
+#### Placeholders
 
 | Placeholder | Description | Example (237.x on OpenShift) |
 |---|---|---|
@@ -499,9 +477,9 @@ spec:
 
 ---
 
-## Filled-In Examples
+#### Filled-In Examples
 
-### Red Hat Image on OpenShift (primary use case — `nxe_linux_237.1.148.0` + KMM)
+#### Red Hat Image on OpenShift (primary use case — `nxe_linux_237.1.148.0` + KMM)
 
 ```yaml
 apiVersion: v1
@@ -523,7 +501,7 @@ spec:
         type: File
 ```
 
-### ROCm Image (upstream, Ubuntu)
+#### ROCm Image (upstream, Ubuntu)
 
 ```yaml
 apiVersion: v1
@@ -545,7 +523,7 @@ spec:
         type: File
 ```
 
-### CUDA Image (upstream, Ubuntu)
+#### CUDA Image (upstream, Ubuntu)
 
 ```yaml
 apiVersion: v1
@@ -569,7 +547,7 @@ spec:
 
 ---
 
-## Notes
+#### Notes
 
 - **`rdmav57` on host vs `rdmav34` in container**: The `nxe_linux_237.1.148.0` package ships
   `libbnxt_re-rdmav57.so` (built for RHEL 9.7 / rdma-core ~v57). Container images use the inbox
@@ -603,3 +581,44 @@ spec:
 - **Node Feature Discovery (NFD)**: Consider using NFD labels (e.g.
   `feature.node.kubernetes.io/pci-14e4.present`) in pod `nodeSelector` to ensure vLLM pods
   only schedule on nodes with Broadcom NICs that have the driver installed.
+
+
+
+<!-- ### GPUDirect peer-memory paths: `ib_peer_mem` vs dmabuf
+
+GPUDirect RDMA needs a way for the RDMA stack to pin/map **GPU** memory. On
+Broadcom Thor2 this is not just `libbnxt_re` ↔ `bnxt_re`; two host-side approaches
+matter for CUDA and ROCm:
+
+| Path | What it is | Typical stack |
+|---|---|---|
+| **Legacy Peer Memory Direct** | Broadcom’s peer-mem client model | `ib_peer_mem` **kernel module** (+ GPU-side peer module) |
+| **dmabuf** | Upstream DMA-BUF registration | `ibv_reg_dmabuf_mr` via a capable matched UMD/KMD |
+
+**`ib_peer_mem` is a kernel module, not a userspace library.** It ships in
+Broadcom’s Peer Memory Direct / `netxtreme-peer-mem` package (often as DKMS)
+alongside the OOB `bnxt_en` / `bnxt_re` modules for that same release.
+
+**Legacy (non-dmabuf) CUDA path — yes, both modules together:** Broadcom’s
+NVIDIA GPUDirect / Peer Memory Direct docs load **`ib_peer_mem`** (NIC/RDMA
+peer client) **and** **`nvidia-peermem`** (NVIDIA GPU driver peer module), plus
+`bnxt_en` / `bnxt_re`. They solve different sides of the P2P path; one does not
+replace the other. Exception: some distro kernels already expose inbox
+peer-memory APIs — Broadcom’s build may then skip its `ib_peer_mem` module, and
+`nvidia-peermem` alone can be enough on that kernel.
+
+**ROCm:** Broadcom’s AMD Instinct (e.g. MI300X) guides likewise require
+`ib_peer_mem` for Peer Memory Direct with ROCm/RCCL workloads (paired with the
+AMD GPU driver stack, not `nvidia-peermem`).
+
+**Version matching on the legacy path:** treat `ib_peer_mem` like `bnxt_re` —
+it must come from the **same Broadcom release train** as the loaded
+`bnxt_en` / `bnxt_re` (the peer-mem DKMS bundle is versioned with them). Do not
+mix an older `ib_peer_mem` with a newer OOB `bnxt_re` train.
+
+**dmabuf path:** newer userspace/kernel registration (`ibv_reg_dmabuf_mr`) used
+by modern CUDA/ROCm collectives and libraries. It still requires a
+**version-matched, GPUDirect-capable** `libbnxt_re` ↔ `bnxt_re` pair; inbox UMD
+against OOB KMD will not reliably enable it. Whether a given cluster uses
+legacy peer-mem, dmabuf, or both depends on kernel, GPU driver, and app stack —
+the UMD/KMD match requirement remains either way. -->
